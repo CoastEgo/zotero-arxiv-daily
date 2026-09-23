@@ -13,12 +13,17 @@ from time import sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
+import re
 
 T = TypeVar("T")
 
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+
+
+def _remove_version_suffix(paper_id: str) -> str:
+    return re.sub(r"v\d+$", "", paper_id)
 
 
 def _download_file(url: str, path: str) -> None:
@@ -136,7 +141,9 @@ class ArxivRetriever(BaseRetriever):
         max_batch_retries = 5
         batch_retry_delay = 30
         for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
+            batch_ids = all_paper_ids[i:i + 20]
+            search = arxiv.Search(id_list=batch_ids)
+            retried_without_version = False
             for attempt in range(max_batch_retries):
                 try:
                     batch = list(client.results(search))
@@ -148,6 +155,16 @@ class ArxivRetriever(BaseRetriever):
                         wait = batch_retry_delay * (attempt + 1)
                         logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
                         sleep(wait)
+                    elif exc.status == 406 and not retried_without_version:
+                        normalized_batch_ids = [_remove_version_suffix(paper_id) for paper_id in batch_ids]
+                        if normalized_batch_ids != batch_ids:
+                            logger.warning(
+                                f"arXiv API 406 on batch {i // 20}; retrying without version suffix in paper IDs"
+                            )
+                            search = arxiv.Search(id_list=normalized_batch_ids)
+                            retried_without_version = True
+                            continue
+                        raise
                     else:
                         raise
             if i + 20 < len(all_paper_ids):
